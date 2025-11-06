@@ -13,7 +13,7 @@ PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.3.3")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.4.0")
 
 # CORS
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
@@ -36,7 +36,6 @@ def _ensure_parquet_exists():
 def _duck():
     """Connexion DuckDB prête à lire des parquets locaux et distants."""
     con = duckdb.connect()
-    # httpfs est neutre en local, utile si PARQUET_PATH pointe vers une URL
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("PRAGMA threads=" + str(os.cpu_count() or 4))
     return con
@@ -104,11 +103,9 @@ def query(sql: str = Query(..., description="Requête SQL SELECT uniquement"),
     con = _duck()
     try:
         if "read_parquet(" not in safe_sql.lower():
-            # Vue pratique si l'utilisateur n'emploie pas read_parquet(...)
             con.execute("CREATE OR REPLACE VIEW parquet_table AS SELECT * FROM read_parquet(?)", [PARQUET_PATH])
             result = con.execute(safe_sql).fetchdf()
         else:
-            # Si l'utilisateur a mis read_parquet(?), on lie le paramètre
             result = con.execute(safe_sql, [PARQUET_PATH]).fetchdf()
 
         return _json({"rows": df_records_safe(result)})
@@ -141,10 +138,6 @@ def upload_parquet(file: UploadFile = File(...), x_api_key: Optional[str] = Head
 
 @app.get("/count")
 def count_rows(x_api_key: Optional[str] = Header(None)):
-    """
-    Renvoie le nombre total de lignes du parquet.
-    Si API_KEY est défini dans l'env, exige le header X-API-Key.
-    """
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
     _ensure_parquet_exists()
@@ -163,11 +156,27 @@ _ALLOWED_ORDER_BY = {
     "acheteur_region_nom", "titulaire_nom", "procedure"
 }
 
+# Colonnes texte scannées par la recherche plein-texte q
+_TEXT_COLS = [
+    "objet","acheteur_nom","titulaire_nom","codeCPV","procedure","techniques",
+    "modalitesExecution","considerationsSociales","considerationsEnvironnementales",
+    "ccag","typesPrix","formePrix",
+    "acheteur_commune_nom","acheteur_departement_nom","acheteur_region_nom",
+    "titulaire_commune_nom","titulaire_departement_nom","titulaire_region_nom",
+    "sourceDataset","sourceFile"
+]
+
 @app.get("/rows")
 def rows(
     x_api_key: Optional[str] = Header(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+
+    # 🔎 NOUVEAU — filtres demandés
+    q: Optional[str] = Query(None, description="mots-clés (AND) sur colonnes texte"),
+    awardee: Optional[List[str]] = Query(None, description="multi: ?awardee=A&awardee=B"),
+
+    # filtres existants (on les garde)
     acheteur_region_nom: Optional[str] = None,
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
@@ -178,7 +187,8 @@ def rows(
 ):
     """
     Renvoie des lignes paginées + filtres.
-    Si API_KEY est défini dans l'env, exige le header X-API-Key.
+    - q : mots-clés, AND entre tokens, OR entre colonnes texte
+    - awardee : filtres multi sur titulaire_nom (exact match)
     """
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
@@ -188,9 +198,11 @@ def rows(
     order_by = order_by if order_by in _ALLOWED_ORDER_BY else "dateNotification"
     order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
 
-    # WHERE sécurisé (paramètres liés)
+    # WHERE sécurisé (tous les paramètres liés)
     where = []
     params: List[object] = []
+
+    # Filtres classiques
     if acheteur_region_nom:
         where.append("acheteur_region_nom = ?")
         params.append(acheteur_region_nom)
@@ -206,6 +218,25 @@ def rows(
     if max_montant is not None:
         where.append("montant <= ?")
         params.append(max_montant)
+
+    # 🔎 Mots-clés — AND entre tokens, OR entre colonnes texte (ILIKE)
+    if q:
+        tokens = [t for t in re.split(r"\s+", q.strip()) if t]
+        for t in tokens:
+            ors = []
+            like = f"%{t}%"
+            for col in _TEXT_COLS:
+                ors.append(f"{col} ILIKE ? ESCAPE '\\\\'")
+                params.append(like)
+            where.append("(" + " OR ".join(ors) + ")")
+
+    # 🧩 Awardees (multi)
+    if awardee:
+        vals = [a for a in awardee if a and a.strip()]
+        if vals:
+            where.append("titulaire_nom IN (" + ",".join(["?"]*len(vals)) + ")")
+            params.extend(vals)
+
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     con = _duck()
@@ -214,19 +245,19 @@ def rows(
         total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
         total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
 
-        # page
+        # page (lat/lon nettoyés pour la carte/table)
         page_sql = f"""
             SELECT uid, acheteur_nom, montant, dateNotification,
-                   acheteur_region_nom, titulaire_nom, procedure,
+                   acheteur_region_nom, titulaire_nom, procedure, objet,
                    CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
-                   CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude,
-                   objet
+                   CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
             FROM read_parquet(?)
             {where_sql}
             ORDER BY {order_by} {order_dir}
             LIMIT ? OFFSET ?
         """
         df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
+
         return _json({
             "total": int(total),
             "limit": int(limit),
@@ -246,10 +277,6 @@ def aggregate_region(
     order: str = Query("total", description="total ou n"),
     order_dir: str = Query("DESC"),
 ):
-    """
-    Agrégat par région acheteur pour une année donnée.
-    Si API_KEY est défini dans l'env, exige le header X-API-Key.
-    """
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
     _ensure_parquet_exists()
