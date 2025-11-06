@@ -4,6 +4,7 @@ from typing import Optional, List
 
 import duckdb
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,7 +14,7 @@ PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.4.1")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.4.2")
 
 # CORS
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
@@ -40,10 +41,24 @@ def _duck():
     con.execute("PRAGMA threads=" + str(os.cpu_count() or 4))
     return con
 
-def df_records_safe(df):
-    """Remplace ±Inf par NaN puis NaN -> None et encode proprement (dates, etc.)."""
+def df_records_safe(df: pd.DataFrame):
+    """
+    Nettoyage total avant JSON:
+    - remplace ±Inf -> NaN
+    - convertit NaN/pd.NA/NaT -> None
+    - convertit les dtypes pandas/numpy vers types Python natifs
+    """
+    if df is None:
+        return []
+    # Remplacer inf par NaN
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.where(df.notna(), None)
+    # Remplacer toutes valeurs nulles (NaN, pd.NA, NaT) par None
+    df = df.where(pd.notnull(df), None)
+    # S'assure que les colonnes flottantes deviennent des objets Python natifs
+    for col in df.columns:
+        # Forcer object pour éviter des scalaires numpy non sérialisables
+        if pd.api.types.is_float_dtype(df[col]) or pd.api.types.is_integer_dtype(df[col]):
+            df[col] = df[col].astype(object)
     return jsonable_encoder(df.to_dict(orient="records"))
 
 def _json(data):
@@ -156,7 +171,7 @@ _ALLOWED_ORDER_BY = {
     "acheteur_region_nom", "titulaire_nom", "procedure"
 }
 
-# Colonnes texte scannées par la recherche plein-texte q
+# Colonnes texte scannées par la recherche plein-texte q (resserré)
 _TEXT_COLS = [
     "objet",          # description du marché
     "titulaire_nom",  # entreprise attributaire
@@ -224,7 +239,8 @@ def rows(
 
     # q : AND entre tokens, OR entre colonnes texte
     if q:
-        tokens = [t for t in re.split(r"\s+", q.strip()) if t]
+        raw_tokens = [t for t in re.split(r"\s+", q.strip()) if t]
+        tokens = [t for t in raw_tokens if len(t) >= 3][:4]  # garde-fous perf
         for t in tokens:
             safe_like = f"%{_escape_like_token(t)}%"
             ors = []
@@ -249,9 +265,11 @@ def rows(
         total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
         total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
 
-        # page (lat/lon nettoyés)
+        # page (montant/lat/lon nettoyés)
         page_sql = f"""
-            SELECT uid, acheteur_nom, montant, dateNotification,
+            SELECT uid, acheteur_nom,
+                   CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,
+                   dateNotification,
                    acheteur_region_nom, titulaire_nom, procedure, objet,
                    CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
                    CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
