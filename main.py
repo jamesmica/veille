@@ -165,13 +165,12 @@ def count_rows(x_api_key: Optional[str] = Header(None)):
     finally:
         con.close()
 
-# Colonnes autorisées pour le tri (évite l'injection SQL sur ORDER BY)
+# --- config tri + recherche ---
 _ALLOWED_ORDER_BY = {
     "uid", "acheteur_nom", "montant", "dateNotification",
     "acheteur_region_nom", "titulaire_nom", "procedure"
 }
 
-# Colonnes texte scannées par la recherche plein-texte q (resserré)
 _TEXT_COLS = [
     "objet",          # description du marché
     "titulaire_nom",  # entreprise attributaire
@@ -181,7 +180,7 @@ _TEXT_COLS = [
 ]
 
 def _escape_like_token(t: str) -> str:
-    """Échappe \, %, _ pour ILIKE ... ESCAPE '\\'"""
+    # pour ILIKE ... ESCAPE '\'
     return t.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 @app.get("/rows")
@@ -190,11 +189,11 @@ def rows(
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 
-    # Filtres demandés
+    # filtres demandés
     q: Optional[str] = Query(None, description="mots-clés (AND) sur colonnes texte"),
     awardee: Optional[List[str]] = Query(None, description="multi: ?awardee=A&awardee=B"),
 
-    # Filtres existants (conservés)
+    # filtres existants
     acheteur_region_nom: Optional[str] = None,
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
@@ -203,16 +202,11 @@ def rows(
     order_by: str = Query("dateNotification"),
     order_dir: str = Query("DESC"),
 ):
-    """
-    Renvoie des lignes paginées + filtres.
-    - q : mots-clés, AND entre tokens, OR entre colonnes texte (ILIKE ... ESCAPE '\')
-    - awardee : filtre multi sur titulaire_nom (match exact)
-    """
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
     _ensure_parquet_exists()
 
-    # Validation tri
+    # Tri sûr
     order_by = order_by if order_by in _ALLOWED_ORDER_BY else "dateNotification"
     order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
 
@@ -220,7 +214,6 @@ def rows(
     where = []
     params: List[object] = []
 
-    # Filtres classiques
     if acheteur_region_nom:
         where.append("acheteur_region_nom = ?")
         params.append(acheteur_region_nom)
@@ -237,15 +230,14 @@ def rows(
         where.append("montant <= ?")
         params.append(max_montant)
 
-    # q : AND entre tokens, OR entre colonnes texte
+    # q : AND entre tokens (on ignore <3 chars et on garde max 4 tokens)
     if q:
         raw_tokens = [t for t in re.split(r"\s+", q.strip()) if t]
-        tokens = [t for t in raw_tokens if len(t) >= 3][:4]  # garde-fous perf
+        tokens = [t for t in raw_tokens if len(t) >= 3][:4]
         for t in tokens:
             safe_like = f"%{_escape_like_token(t)}%"
             ors = []
             for col in _TEXT_COLS:
-                # IMPORTANT: un seul backslash dans ESCAPE côté SQL
                 ors.append(f"{col} ILIKE ? ESCAPE '\\'")
                 params.append(safe_like)
             where.append("(" + " OR ".join(ors) + ")")
@@ -254,76 +246,49 @@ def rows(
     if awardee:
         vals = [a for a in awardee if a and a.strip()]
         if vals:
-            where.append("titulaire_nom IN (" + ",".join(["?"]*len(vals)) + ")")
+            where.append("titulaire_nom IN (" + ",".join(["?"] * len(vals)) + ")")
             params.extend(vals)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     con = _duck()
     try:
-        # total
-        total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
-        total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
-
-        # page (montant/lat/lon nettoyés)
-page_sql = f"""
-    SELECT
-        uid,
-        acheteur_nom,
-        CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,  -- ✅ nettoie montant
-        dateNotification,
-        acheteur_region_nom,
-        titulaire_nom,
-        procedure,
-        objet,
-        CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
-        CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
-    FROM read_parquet(?)
-    {where_sql}
-    ORDER BY {order_by} {order_dir}
-    LIMIT ? OFFSET ?
-"""
-
+        # Un seul scan parquet: on calcule le total via COUNT(*) OVER()
+        page_sql = f"""
+            WITH base AS (
+                SELECT
+                    uid,
+                    acheteur_nom,
+                    CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,
+                    dateNotification,
+                    acheteur_region_nom,
+                    titulaire_nom,
+                    procedure,
+                    objet,
+                    CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
+                    CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
+                FROM read_parquet(?)
+                {where_sql}
+            )
+            SELECT
+                *,
+                COUNT(*) OVER() AS __total
+            FROM base
+            ORDER BY {order_by} {order_dir}
+            LIMIT ? OFFSET ?
+        """
         df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
 
+        total = int(df["__total"].iloc[0]) if len(df) else 0
+        if "__total" in df.columns:
+            df = df.drop(columns=["__total"])
+
         return _json({
-            "total": int(total),
+            "total": total,
             "limit": int(limit),
             "offset": int(offset),
             "rows": df_records_safe(df),
         })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        con.close()
-
-@app.get("/aggregate/region")
-def aggregate_region(
-    x_api_key: Optional[str] = Header(None),
-    year: int = Query(..., ge=2000, le=2100),
-    top: int = Query(20, ge=1, le=100),
-    order: str = Query("total", description="total ou n"),
-    order_dir: str = Query("DESC"),
-):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
-    _ensure_parquet_exists()
-
-    order = "n" if order == "n" else "total"
-    order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
-
-    con = _duck()
-    try:
-        sql = f"""
-            SELECT acheteur_region_nom, COUNT(*) AS n, SUM(montant) AS total
-            FROM read_parquet(?)
-            WHERE dateNotification BETWEEN DATE ? AND DATE ?
-            GROUP BY 1
-            ORDER BY {order} {order_dir}
-            LIMIT ?
-        """
-        df = con.execute(sql, [PARQUET_PATH, f"{year}-01-01", f"{year}-12-31", top]).fetchdf()
-        return _json(df_records_safe(df))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
