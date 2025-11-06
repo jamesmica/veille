@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Optional
+from typing import Optional, List
 
 import duckdb
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
@@ -11,7 +11,7 @@ PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.2.1")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.3.0")
 
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -29,6 +29,17 @@ def _ensure_parquet_exists():
             detail=f"Parquet introuvable: {PARQUET_PATH}. Upload via /upload ou définis PARQUET_PATH."
         )
 
+def _duck():
+    """
+    Connexion DuckDB prête à lire des parquets locaux et distants.
+    """
+    con = duckdb.connect()
+    # httpfs est inoffensif pour un fichier local, mais utile si PARQUET_PATH est une URL
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    # Utilise tous les CPU dispos si DuckDB veut paralléliser
+    con.execute("PRAGMA threads=" + str(os.cpu_count() or 4))
+    return con
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -37,8 +48,7 @@ def health():
 def schema():
     _ensure_parquet_exists()
     try:
-        con = duckdb.connect()
-        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con = _duck()
         df = con.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)",
             [PARQUET_PATH]
@@ -52,8 +62,7 @@ def schema():
 def preview(limit: int = Query(50, ge=1, le=5000)):
     _ensure_parquet_exists()
     try:
-        con = duckdb.connect()
-        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con = _duck()
         df = con.execute(
             "SELECT * FROM read_parquet(?) LIMIT ?",
             [PARQUET_PATH, limit]
@@ -77,10 +86,7 @@ def query(sql: str = Query(..., description="Requête SQL SELECT uniquement"),
         safe_sql = f"{safe_sql} LIMIT {limit}"
 
     try:
-        con = duckdb.connect()
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-        con.execute("PRAGMA threads=" + str(os.cpu_count() or 4))
-
+        con = _duck()
         if "read_parquet(" not in safe_sql.lower():
             # Vue pratique si l'utilisateur n'emploie pas read_parquet(...)
             con.execute("CREATE OR REPLACE VIEW parquet_table AS SELECT * FROM read_parquet(?)", [PARQUET_PATH])
@@ -110,3 +116,134 @@ def upload_parquet(file: UploadFile = File(...), x_api_key: Optional[str] = Head
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         file.file.close()
+
+# ---------------------------------------------------------------------------
+#             >> Nouveaux endpoints API lisibles au navigateur <<
+# ---------------------------------------------------------------------------
+
+@app.get("/count")
+def count_rows(x_api_key: Optional[str] = Header(None)):
+    """
+    Renvoie le nombre total de lignes du parquet.
+    Si API_KEY est défini dans l'env, exige le header X-API-Key.
+    """
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
+    _ensure_parquet_exists()
+    try:
+        con = _duck()
+        n = con.execute("SELECT COUNT(*) FROM read_parquet(?)", [PARQUET_PATH]).fetchone()[0]
+        return {"rows": n}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Colonnes autorisées pour le tri (évite l'injection SQL sur ORDER BY)
+_ALLOWED_ORDER_BY = {
+    "uid", "acheteur_nom", "montant", "dateNotification",
+    "acheteur_region_nom", "titulaire_nom", "procedure"
+}
+
+@app.get("/rows")
+def rows(
+    x_api_key: Optional[str] = Header(None),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    acheteur_region_nom: Optional[str] = None,
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    min_montant: Optional[float] = None,
+    max_montant: Optional[float] = None,
+    order_by: str = Query("dateNotification"),
+    order_dir: str = Query("DESC"),
+):
+    """
+    Renvoie des lignes paginées + filtres.
+    Si API_KEY est défini dans l'env, exige le header X-API-Key.
+    """
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
+    _ensure_parquet_exists()
+
+    # Validation tri
+    order_by = order_by if order_by in _ALLOWED_ORDER_BY else "dateNotification"
+    order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
+
+    # WHERE sécurisé (paramètres liés)
+    where = []
+    params: List[object] = []
+    if acheteur_region_nom:
+        where.append("acheteur_region_nom = ?")
+        params.append(acheteur_region_nom)
+    if date_from:
+        where.append("dateNotification >= DATE ?")
+        params.append(date_from)
+    if date_to:
+        where.append("dateNotification <= DATE ?")
+        params.append(date_to)
+    if min_montant is not None:
+        where.append("montant >= ?")
+        params.append(min_montant)
+    if max_montant is not None:
+        where.append("montant <= ?")
+        params.append(max_montant)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    try:
+        con = _duck()
+
+        # total
+        total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
+        total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
+
+        # page
+        page_sql = f"""
+            SELECT uid, acheteur_nom, montant, dateNotification,
+                   acheteur_region_nom, titulaire_nom, procedure
+            FROM read_parquet(?)
+            {where_sql}
+            ORDER BY {order_by} {order_dir}
+            LIMIT ? OFFSET ?
+        """
+        df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
+        return JSONResponse(content={
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "rows": df.to_dict(orient="records"),
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/aggregate/region")
+def aggregate_region(
+    x_api_key: Optional[str] = Header(None),
+    year: int = Query(..., ge=2000, le=2100),
+    top: int = Query(20, ge=1, le=100),
+    order: str = Query("total", description="total ou n"),
+    order_dir: str = Query("DESC"),
+):
+    """
+    Agrégat par région acheteur pour une année donnée.
+    Si API_KEY est défini dans l'env, exige le header X-API-Key.
+    """
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
+    _ensure_parquet_exists()
+
+    order = "n" if order == "n" else "total"
+    order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
+
+    try:
+        con = _duck()
+        sql = f"""
+            SELECT acheteur_region_nom, COUNT(*) AS n, SUM(montant) AS total
+            FROM read_parquet(?)
+            WHERE dateNotification BETWEEN DATE ? AND DATE ?
+            GROUP BY 1
+            ORDER BY {order} {order_dir}
+            LIMIT ?
+        """
+        df = con.execute(sql, [PARQUET_PATH, f"{year}-01-01", f"{year}-12-31", top]).fetchdf()
+        return JSONResponse(content=df.to_dict(orient="records"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
