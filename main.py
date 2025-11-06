@@ -158,12 +158,11 @@ _ALLOWED_ORDER_BY = {
 
 # Colonnes texte scannées par la recherche plein-texte q
 _TEXT_COLS = [
-    "objet","acheteur_nom","titulaire_nom","codeCPV","procedure","techniques",
-    "modalitesExecution","considerationsSociales","considerationsEnvironnementales",
-    "ccag","typesPrix","formePrix",
-    "acheteur_commune_nom","acheteur_departement_nom","acheteur_region_nom",
-    "titulaire_commune_nom","titulaire_departement_nom","titulaire_region_nom",
-    "sourceDataset","sourceFile"
+    "objet",          # description du marché
+    "titulaire_nom",  # entreprise attributaire
+    "acheteur_nom",   # acheteur
+    "codeCPV",        # code CPV
+    "procedure"       # type de procédure
 ]
 
 def _escape_like_token(t: str) -> str:
