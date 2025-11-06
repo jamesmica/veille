@@ -1,5 +1,7 @@
 import os
 import re
+import math
+import datetime
 from typing import Optional, List
 
 import duckdb
@@ -14,9 +16,9 @@ PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.4.2")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.4.3")
 
-# CORS
+# ------- CORS -------
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -26,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Helpers
+# ------- Helpers -------
 def _ensure_parquet_exists():
     if not os.path.exists(PARQUET_PATH):
         raise HTTPException(
@@ -41,31 +43,49 @@ def _duck():
     con.execute("PRAGMA threads=" + str(os.cpu_count() or 4))
     return con
 
+def _to_safe_scalar(v):
+    # numpy scalars -> python natif
+    if isinstance(v, np.generic):
+        v = v.item()
+    # floats invalides -> None
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return float(v)
+    # dates -> ISO
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
+        try:
+            return pd.to_datetime(v).date().isoformat()
+        except Exception:
+            return None
+    # bytes -> str
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return v.decode("utf-8", "replace")
+        except Exception:
+            return v.decode("latin-1", "replace")
+    return v
+
 def df_records_safe(df: pd.DataFrame):
     """
     Nettoyage total avant JSON:
     - remplace ±Inf -> NaN
     - convertit NaN/pd.NA/NaT -> None
-    - convertit les dtypes pandas/numpy vers types Python natifs
+    - convertit toutes les valeurs en scalaires Python sûrs (dates ISO, etc.)
     """
-    if df is None:
+    if df is None or df.empty:
         return []
-    # Remplacer inf par NaN
     df = df.replace([np.inf, -np.inf], np.nan)
-    # Remplacer toutes valeurs nulles (NaN, pd.NA, NaT) par None
     df = df.where(pd.notnull(df), None)
-    # S'assure que les colonnes flottantes deviennent des objets Python natifs
-    for col in df.columns:
-        # Forcer object pour éviter des scalaires numpy non sérialisables
-        if pd.api.types.is_float_dtype(df[col]) or pd.api.types.is_integer_dtype(df[col]):
-            df[col] = df[col].astype(object)
-    return jsonable_encoder(df.to_dict(orient="records"))
+    records = df.to_dict(orient="records")
+    safe = [{k: _to_safe_scalar(v) for k, v in row.items()} for row in records]
+    return jsonable_encoder(safe)
 
 def _json(data):
     """Encodage JSON sûr pour dict/list/valeurs simples."""
     return JSONResponse(content=jsonable_encoder(data))
 
-# Routes
+# ------- Routes utilitaires -------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -147,10 +167,7 @@ def upload_parquet(file: UploadFile = File(...), x_api_key: Optional[str] = Head
     finally:
         file.file.close()
 
-# ---------------------------------------------------------------------------
-#             >> Endpoints API lisibles au navigateur <<
-# ---------------------------------------------------------------------------
-
+# ------- Endpoints “navigateur” -------
 @app.get("/count")
 def count_rows(x_api_key: Optional[str] = Header(None)):
     if API_KEY and x_api_key != API_KEY:
@@ -250,20 +267,26 @@ def rows(
 
     con = _duck()
     try:
-        # --- un seul scan parquet + total en fenêtre ---
+        # Nettoyage SQL (textes sans caractères de contrôle, clamp valeurs, date en VARCHAR)
         page_sql = f"""
             WITH base AS (
                 SELECT
                     uid,
-                    acheteur_nom,
-                    CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,
-                    dateNotification,
-                    acheteur_region_nom,
-                    titulaire_nom,
-                    procedure,
-                    objet,
-                    CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
-                    CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
+                    regexp_replace(acheteur_nom,  '[\\x00-\\x1F\\x7F]', ' ', 'g') AS acheteur_nom,
+                    regexp_replace(titulaire_nom, '[\\x00-\\x1F\\x7F]', ' ', 'g') AS titulaire_nom,
+                    regexp_replace(procedure,     '[\\x00-\\x1F\\x7F]', ' ', 'g') AS procedure,
+                    regexp_replace(objet,         '[\\x00-\\x1F\\x7F]', ' ', 'g') AS objet,
+                    regexp_replace(acheteur_region_nom, '[\\x00-\\x1F\\x7F]', ' ', 'g') AS acheteur_region_nom,
+
+                    CASE WHEN isfinite(montant) AND abs(montant) < 1e12
+                         THEN CAST(montant AS DOUBLE) ELSE NULL END AS montant,
+
+                    CAST(dateNotification AS VARCHAR) AS dateNotification,
+
+                    CASE WHEN isfinite(acheteur_latitude)  AND abs(acheteur_latitude)  <= 90
+                         THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
+                    CASE WHEN isfinite(acheteur_longitude) AND abs(acheteur_longitude) <= 180
+                         THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
                 FROM read_parquet(?)
                 {where_sql}
             )
@@ -281,7 +304,6 @@ def rows(
             total = int(df["__total"].max())
             df = df.drop(columns=["__total"])
         else:
-            # Fallback (rare) : compte séparé
             total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
             total = int(con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0])
 
@@ -295,4 +317,3 @@ def rows(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         con.close()
-
