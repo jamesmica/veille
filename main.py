@@ -189,7 +189,7 @@ def rows(
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 
-    q: Optional[str] = Query(None, description="mots-clés (AND) sur colonnes texte"),
+    q: str = Query("", description="mots-clés (AND) sur colonnes texte"),
     awardee: Optional[List[str]] = Query(None, description="multi: ?awardee=A&awardee=B"),
 
     acheteur_region_nom: Optional[str] = None,
@@ -228,7 +228,7 @@ def rows(
         params.append(max_montant)
 
     # q : AND entre tokens, OR entre colonnes texte
-    if q:
+    if q and q.strip():
         raw_tokens = [t for t in re.split(r"\s+", q.strip()) if t]
         tokens = [t for t in raw_tokens if len(t) >= 3][:4]  # garde-fous perfs
         for t in tokens:
