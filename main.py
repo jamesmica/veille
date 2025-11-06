@@ -13,7 +13,7 @@ PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.4.0")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.4.1")
 
 # CORS
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
@@ -166,17 +166,21 @@ _TEXT_COLS = [
     "sourceDataset","sourceFile"
 ]
 
+def _escape_like_token(t: str) -> str:
+    """Échappe \, %, _ pour ILIKE ... ESCAPE '\\'"""
+    return t.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
 @app.get("/rows")
 def rows(
     x_api_key: Optional[str] = Header(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 
-    # 🔎 NOUVEAU — filtres demandés
+    # Filtres demandés
     q: Optional[str] = Query(None, description="mots-clés (AND) sur colonnes texte"),
     awardee: Optional[List[str]] = Query(None, description="multi: ?awardee=A&awardee=B"),
 
-    # filtres existants (on les garde)
+    # Filtres existants (conservés)
     acheteur_region_nom: Optional[str] = None,
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
@@ -187,8 +191,8 @@ def rows(
 ):
     """
     Renvoie des lignes paginées + filtres.
-    - q : mots-clés, AND entre tokens, OR entre colonnes texte
-    - awardee : filtres multi sur titulaire_nom (exact match)
+    - q : mots-clés, AND entre tokens, OR entre colonnes texte (ILIKE ... ESCAPE '\')
+    - awardee : filtre multi sur titulaire_nom (match exact)
     """
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
@@ -198,7 +202,7 @@ def rows(
     order_by = order_by if order_by in _ALLOWED_ORDER_BY else "dateNotification"
     order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
 
-    # WHERE sécurisé (tous les paramètres liés)
+    # WHERE paramétré
     where = []
     params: List[object] = []
 
@@ -219,18 +223,19 @@ def rows(
         where.append("montant <= ?")
         params.append(max_montant)
 
-    # 🔎 Mots-clés — AND entre tokens, OR entre colonnes texte (ILIKE)
+    # q : AND entre tokens, OR entre colonnes texte
     if q:
         tokens = [t for t in re.split(r"\s+", q.strip()) if t]
         for t in tokens:
+            safe_like = f"%{_escape_like_token(t)}%"
             ors = []
-            like = f"%{t}%"
             for col in _TEXT_COLS:
-                ors.append(f"{col} ILIKE ? ESCAPE '\\\\'")
-                params.append(like)
+                # IMPORTANT: un seul backslash dans ESCAPE côté SQL
+                ors.append(f"{col} ILIKE ? ESCAPE '\\'")
+                params.append(safe_like)
             where.append("(" + " OR ".join(ors) + ")")
 
-    # 🧩 Awardees (multi)
+    # awardee multi
     if awardee:
         vals = [a for a in awardee if a and a.strip()]
         if vals:
@@ -245,7 +250,7 @@ def rows(
         total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
         total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
 
-        # page (lat/lon nettoyés pour la carte/table)
+        # page (lat/lon nettoyés)
         page_sql = f"""
             SELECT uid, acheteur_nom, montant, dateNotification,
                    acheteur_region_nom, titulaire_nom, procedure, objet,
