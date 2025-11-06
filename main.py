@@ -189,11 +189,9 @@ def rows(
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 
-    # filtres demandés
     q: Optional[str] = Query(None, description="mots-clés (AND) sur colonnes texte"),
     awardee: Optional[List[str]] = Query(None, description="multi: ?awardee=A&awardee=B"),
 
-    # filtres existants
     acheteur_region_nom: Optional[str] = None,
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
@@ -206,14 +204,13 @@ def rows(
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
     _ensure_parquet_exists()
 
-    # Tri sûr
     order_by = order_by if order_by in _ALLOWED_ORDER_BY else "dateNotification"
     order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
 
-    # WHERE paramétré
     where = []
     params: List[object] = []
 
+    # filtres classiques
     if acheteur_region_nom:
         where.append("acheteur_region_nom = ?")
         params.append(acheteur_region_nom)
@@ -230,10 +227,10 @@ def rows(
         where.append("montant <= ?")
         params.append(max_montant)
 
-    # q : AND entre tokens (on ignore <3 chars et on garde max 4 tokens)
+    # q : AND entre tokens, OR entre colonnes texte
     if q:
         raw_tokens = [t for t in re.split(r"\s+", q.strip()) if t]
-        tokens = [t for t in raw_tokens if len(t) >= 3][:4]
+        tokens = [t for t in raw_tokens if len(t) >= 3][:4]  # garde-fous perfs
         for t in tokens:
             safe_like = f"%{_escape_like_token(t)}%"
             ors = []
@@ -253,13 +250,13 @@ def rows(
 
     con = _duck()
     try:
-        # Un seul scan parquet: on calcule le total via COUNT(*) OVER()
+        # --- un seul scan parquet + total en fenêtre ---
         page_sql = f"""
             WITH base AS (
                 SELECT
                     uid,
                     acheteur_nom,
-                    CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,  -- ✅ nettoie montant
+                    CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,
                     dateNotification,
                     acheteur_region_nom,
                     titulaire_nom,
@@ -271,17 +268,22 @@ def rows(
                 {where_sql}
             )
             SELECT
-                *
+                base.*,
+                COUNT(*) OVER() AS __total
             FROM base
             ORDER BY {order_by} {order_dir}
             LIMIT ? OFFSET ?
         """
-
         df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
 
-        total = int(df["__total"].iloc[0]) if len(df) else 0
-        if "__total" in df.columns:
+        # total robuste (avec fallback si __total absent)
+        if len(df) and "__total" in df.columns:
+            total = int(df["__total"].max())
             df = df.drop(columns=["__total"])
+        else:
+            # Fallback (rare) : compte séparé
+            total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
+            total = int(con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0])
 
         return _json({
             "total": total,
