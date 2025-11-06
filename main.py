@@ -6,12 +6,13 @@ import duckdb
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 
 PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.3.0")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.3.1")
 
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -34,11 +35,15 @@ def _duck():
     Connexion DuckDB prête à lire des parquets locaux et distants.
     """
     con = duckdb.connect()
-    # httpfs est inoffensif pour un fichier local, mais utile si PARQUET_PATH est une URL
+    # httpfs est sans effet pour un fichier local, utile si PARQUET_PATH est une URL
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    # Utilise tous les CPU dispos si DuckDB veut paralléliser
+    # Utiliser tous les CPU disponibles si DuckDB parallélise
     con.execute("PRAGMA threads=" + str(os.cpu_count() or 4))
     return con
+
+def _json(data):
+    """Encodage JSON sûr (timestamps/decimals, etc.)."""
+    return JSONResponse(content=jsonable_encoder(data))
 
 @app.get("/health")
 def health():
@@ -47,8 +52,8 @@ def health():
 @app.get("/schema")
 def schema():
     _ensure_parquet_exists()
+    con = _duck()
     try:
-        con = _duck()
         df = con.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)",
             [PARQUET_PATH]
@@ -57,19 +62,23 @@ def schema():
         return {"path": PARQUET_PATH, "columns": cols}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 @app.get("/preview")
 def preview(limit: int = Query(50, ge=1, le=5000)):
     _ensure_parquet_exists()
+    con = _duck()
     try:
-        con = _duck()
         df = con.execute(
             "SELECT * FROM read_parquet(?) LIMIT ?",
             [PARQUET_PATH, limit]
         ).fetchdf()
-        return JSONResponse(content={"rows": df.to_dict(orient="records"), "limit": limit})
+        return _json({"rows": df.to_dict(orient="records"), "limit": limit})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 _SELECT_RE = re.compile(r"^\s*select\b", re.IGNORECASE)
 
@@ -85,8 +94,8 @@ def query(sql: str = Query(..., description="Requête SQL SELECT uniquement"),
     if limit is not None and re.search(r"\blimit\b", safe_sql, flags=re.IGNORECASE) is None:
         safe_sql = f"{safe_sql} LIMIT {limit}"
 
+    con = _duck()
     try:
-        con = _duck()
         if "read_parquet(" not in safe_sql.lower():
             # Vue pratique si l'utilisateur n'emploie pas read_parquet(...)
             con.execute("CREATE OR REPLACE VIEW parquet_table AS SELECT * FROM read_parquet(?)", [PARQUET_PATH])
@@ -95,9 +104,11 @@ def query(sql: str = Query(..., description="Requête SQL SELECT uniquement"),
             # Si l'utilisateur a mis read_parquet(?), on lie le paramètre
             result = con.execute(safe_sql, [PARQUET_PATH]).fetchdf()
 
-        return JSONResponse(content={"rows": result.to_dict(orient="records")})
+        return _json({"rows": result.to_dict(orient="records")})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        con.close()
 
 @app.post("/upload")
 def upload_parquet(file: UploadFile = File(...), x_api_key: Optional[str] = Header(None)):
@@ -130,12 +141,14 @@ def count_rows(x_api_key: Optional[str] = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="X-API-Key manquante ou invalide")
     _ensure_parquet_exists()
+    con = _duck()
     try:
-        con = _duck()
         n = con.execute("SELECT COUNT(*) FROM read_parquet(?)", [PARQUET_PATH]).fetchone()[0]
         return {"rows": n}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 # Colonnes autorisées pour le tri (évite l'injection SQL sur ORDER BY)
 _ALLOWED_ORDER_BY = {
@@ -188,9 +201,8 @@ def rows(
         params.append(max_montant)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
+    con = _duck()
     try:
-        con = _duck()
-
         # total
         total_sql = f"SELECT COUNT(*) FROM read_parquet(?) {where_sql}"
         total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
@@ -205,7 +217,7 @@ def rows(
             LIMIT ? OFFSET ?
         """
         df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
-        return JSONResponse(content={
+        return _json({
             "total": total,
             "limit": limit,
             "offset": offset,
@@ -213,6 +225,8 @@ def rows(
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 @app.get("/aggregate/region")
 def aggregate_region(
@@ -233,8 +247,8 @@ def aggregate_region(
     order = "n" if order == "n" else "total"
     order_dir = "ASC" if str(order_dir).upper() == "ASC" else "DESC"
 
+    con = _duck()
     try:
-        con = _duck()
         sql = f"""
             SELECT acheteur_region_nom, COUNT(*) AS n, SUM(montant) AS total
             FROM read_parquet(?)
@@ -244,6 +258,8 @@ def aggregate_region(
             LIMIT ?
         """
         df = con.execute(sql, [PARQUET_PATH, f"{year}-01-01", f"{year}-12-31", top]).fetchdf()
-        return JSONResponse(content=df.to_dict(orient="records"))
+        return _json(df.to_dict(orient="records"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
