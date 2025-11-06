@@ -266,18 +266,24 @@ def rows(
         total = con.execute(total_sql, [PARQUET_PATH, *params]).fetchone()[0]
 
         # page (montant/lat/lon nettoyés)
-        page_sql = f"""
-            SELECT uid, acheteur_nom,
-                   CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,
-                   dateNotification,
-                   acheteur_region_nom, titulaire_nom, procedure, objet,
-                   CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
-                   CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
-            FROM read_parquet(?)
-            {where_sql}
-            ORDER BY {order_by} {order_dir}
-            LIMIT ? OFFSET ?
-        """
+page_sql = f"""
+    SELECT
+        uid,
+        acheteur_nom,
+        CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,  -- ✅ nettoie montant
+        dateNotification,
+        acheteur_region_nom,
+        titulaire_nom,
+        procedure,
+        objet,
+        CASE WHEN isfinite(acheteur_latitude)  THEN acheteur_latitude  ELSE NULL END AS acheteur_latitude,
+        CASE WHEN isfinite(acheteur_longitude) THEN acheteur_longitude ELSE NULL END AS acheteur_longitude
+    FROM read_parquet(?)
+    {where_sql}
+    ORDER BY {order_by} {order_dir}
+    LIMIT ? OFFSET ?
+"""
+
         df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
 
         return _json({
