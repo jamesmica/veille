@@ -295,3 +295,4 @@ def rows(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         con.close()
+
