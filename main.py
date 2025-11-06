@@ -259,7 +259,7 @@ def rows(
                 SELECT
                     uid,
                     acheteur_nom,
-                    CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,
+                    CASE WHEN isfinite(montant) THEN montant ELSE NULL END AS montant,  -- ✅ nettoie montant
                     dateNotification,
                     acheteur_region_nom,
                     titulaire_nom,
@@ -271,12 +271,12 @@ def rows(
                 {where_sql}
             )
             SELECT
-                *,
-                COUNT(*) OVER() AS __total
+                *
             FROM base
             ORDER BY {order_by} {order_dir}
             LIMIT ? OFFSET ?
         """
+
         df = con.execute(page_sql, [PARQUET_PATH, *params, limit, offset]).fetchdf()
 
         total = int(df["__total"].iloc[0]) if len(df) else 0
