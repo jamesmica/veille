@@ -13,7 +13,7 @@ PARQUET_PATH = os.environ.get("PARQUET_PATH", "/data/data.parquet")
 API_KEY = os.environ.get("API_KEY")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*")
 
-app = FastAPI(title="Parquet API (DuckDB)", version="0.3.2")
+app = FastAPI(title="Parquet API (DuckDB)", version="0.3.3")
 
 # CORS
 origins = [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
