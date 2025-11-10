@@ -190,10 +190,7 @@ _ALLOWED_ORDER_BY = {
 
 _TEXT_COLS = [
     "objet",          # description du marché
-    "titulaire_nom",  # entreprise attributaire
-    "acheteur_nom",   # acheteur
-    "codeCPV",        # code CPV
-    "procedure"       # type de procédure
+    "titulaire_nom"  # entreprise attributaire
 ]
 
 def _escape_like_token(t: str) -> str:
